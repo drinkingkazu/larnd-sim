@@ -549,6 +549,7 @@ def run_simulation(input_filename,
     # larnd-sim uses "t0" in a way that 0 is the "trigger" time (e.g spill time)
     # Therefore, to run the detector simulation we reset the t0 to reflect that
     # When storing the mc truth, revert this change and store the "real" segment time
+    # The event times are added to segments in the event building stage. This step is not needed for non-beam simulation
     if sim.IS_SPILL_SIM:
         # "Reset" the spill period so t0 is wrt the corresponding spill start time.
         # The spill starts are marking the start of
@@ -588,8 +589,9 @@ def run_simulation(input_filename,
     if sim.IS_SPILL_SIM:
         event_times = cp.arange(num_evids) * sim.SPILL_PERIOD
     else:
-        event_times = fee.gen_event_times(num_evids, 0)
+        event_times = fee.gen_event_times(num_evids, 5000)
 
+    # broadcast the event times to vertices
     if input_has_vertices and not sim.IS_SPILL_SIM:
         # create "t_event" in vertices dataset in case it doesn't exist
         if 't_event' not in vertices.dtype.names:
@@ -597,11 +599,26 @@ def run_simulation(input_filename,
             dtype = [("t_event","f4")] + dtype
             new_vertices = np.empty(vertices.shape, dtype=np.dtype(dtype, align=True))
             for field in dtype[1:]:
+                if len(field[0]) == 0: continue
                 new_vertices[field[0]] = vertices[field[0]]
             vertices = new_vertices
         uniq_ev, counts = np.unique(vertices[sim.EVENT_SEPARATOR], return_counts=True)
         event_times_in_use = cp.take(event_times, uniq_ev)
         vertices['t_event'] = np.repeat(event_times_in_use.get(),counts)
+
+    # copy the event times to mc_hdr
+    if input_has_mc_hdr and input_has_vertices:
+        if 't_event' not in mc_hdr.dtype.names:
+            dtype = mc_hdr.dtype.descr
+            dtype = [("t_event","f4")] + dtype
+            new_mc_hdr = np.empty(mc_hdr.shape, dtype=np.dtype(dtype, align=True))
+            for field in dtype[1:]:
+                if len(field[0]) == 0: continue
+                new_mc_hdr[field[0]] = mc_hdr[field[0]]
+            mc_hdr = new_mc_hdr
+        mc_hdr['t_event'] = vertices['t_event']
+        if len(vertices[sim.EVENT_SEPARATOR]) != len(mc_hdr[sim.EVENT_SEPARATOR]):
+            raise ValueError("vertices and mc_hdr datasets have different number of vertices! The number should be the same.")
 
     # accumulate results for periodic file saving
     results_acc = defaultdict(list)
@@ -678,7 +695,7 @@ def run_simulation(input_filename,
         quenching.quench[BPG,TPB](tracks, physics.BIRKS)
         end_quenching = time()
         logger.take_snapshot()
-        logger.archive('quenching')
+        logger.archive(f'quenching_mod{i_mod}')
         print(f" {end_quenching-start_quenching:.2f} s")
 
         print("Drifting electrons...", end="")
@@ -688,7 +705,7 @@ def run_simulation(input_filename,
         drifting.drift[BPG,TPB](tracks)
         end_drifting = time()
         logger.take_snapshot()
-        logger.archive('drifting')
+        logger.archive(f'drifting_mod{i_mod}')
         print(f" {end_drifting-start_drifting:.2f} s")
 
         # Set up light simulation data objects and calculate the optical responses
@@ -726,7 +743,7 @@ def run_simulation(input_filename,
             light_sim_dat_acc.append(light_sim_dat)
 
             logger.take_snapshot()
-            logger.archive('light')
+            logger.archive(f'light_mod{i_mod}')
 
             # Prepare the light waveform padding
             if light.LIGHT_SIMULATED and (light.LIGHT_TRIG_MODE == 0 or light.LIGHT_TRIG_MODE == 1):
@@ -1164,9 +1181,18 @@ def run_simulation(input_filename,
             is_first_batch = save_results(event_times, is_first_batch, results_acc, i_trig, i_mod, light_only=True)
             i_trig += 1 # add to the trigger counter
         results_acc = defaultdict(list) # reinitialize after each save_results
+
+        # Collect updated true segments
+        if i_mod <= 1: # i_mod counts from 1 for module to module variation, otherwise i_mod is set to -1
+            segments_to_files = tracks # segments are only updated in quenching and drifting, otherwise this part should be in the batching loop
+        else:
+            segments_to_files = np.append(segments_to_files, tracks)
         RangePop()
 
     logger.take_snapshot([len(logger.log)])
+
+    quenching.quench[BPG,TPB](all_mod_tracks, physics.BIRKS)
+    drifting.drift[BPG,TPB](all_mod_tracks)
 
     # revert the mc truth information modified for larnd-sim consumption 
     if sim.IS_SPILL_SIM:
@@ -1175,6 +1201,18 @@ def run_simulation(input_filename,
         all_mod_tracks['t0_start'] = all_mod_tracks['t0_start'] + localSpillIDs*sim.SPILL_PERIOD
         all_mod_tracks['t0_end'] = all_mod_tracks['t0_end'] + localSpillIDs*sim.SPILL_PERIOD
         all_mod_tracks['t0'] = all_mod_tracks['t0'] + localSpillIDs*sim.SPILL_PERIOD
+
+    #    # write the true timing structure to the file, not t0 wrt event time .....
+    #    localSpillIDs = segments_to_files[sim.EVENT_SEPARATOR] - (segments_to_files[sim.EVENT_SEPARATOR] // sim.MAX_EVENTS_PER_FILE) * sim.MAX_EVENTS_PER_FILE
+    #    seg_event_times_padding = localSpillIDs*sim.SPILL_PERIOD
+    #else:
+    #    uniq_seg_ev, counts_seg_ev = np.unique(segments_to_files[sim.EVENT_SEPARATOR], return_counts=True)
+    #    event_times_in_use = cp.take(event_times, uniq_seg_ev) # event_times is defined in the preparation stage
+    #    seg_event_times_padding = np.repeat(event_times_in_use.get(), counts_seg_ev)
+
+    #segments_to_files['t0_start'] = segments_to_files['t0_start'] + seg_event_times_padding
+    #segments_to_files['t0_end'] = segments_to_files['t0_end'] + seg_event_times_padding
+    #segments_to_files['t0'] = segments_to_files['t0'] + seg_event_times_padding
 
     # store light triggers altogether if it's beam trigger (all light channels are forced to trigger)
     # FIXME one can merge the beam + threshold for LIGHT_TRIG_MODE = 1 in future
@@ -1208,6 +1246,11 @@ def run_simulation(input_filename,
 
         # Store all tracks in the gdml module volume, could have small differences because of the active volume check
         output_file.create_dataset(sim.TRACKS_DSET_NAME, data=all_mod_tracks)
+
+        #swap_coordinates(segments_to_files)
+
+        ## Store all simulated segments/tracks to the output
+        #output_file.create_dataset(sim.TRACKS_DSET_NAME, data=segments_to_files)
 
         # To distinguish from the "old" files that had z=drift in 'tracks':
         output_file[sim.TRACKS_DSET_NAME].attrs['zbeam'] = True
