@@ -975,7 +975,8 @@ def run_simulation(input_filename,
 
                 RangePush("track_pixel_map")
                 # Mapping between unique pixel array and track array index
-                max_segments_to_trace = max(assmap_pix2seg.shape[1],detsim.MAX_TRACKS_PER_PIXEL)
+                #max_segments_to_trace = max(assmap_pix2seg.shape[1],detsim.MAX_TRACKS_PER_PIXEL)
+                max_segments_to_trace = detsim.MAX_TRACKS_PER_PIXEL
                 track_pixel_map = cp.full((unique_pix.shape[0], max_segments_to_trace), -1)
                 TPB = 32
                 #BPG = max(ceil(unique_pix.shape[0] / TPB),1)
